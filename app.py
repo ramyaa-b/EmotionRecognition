@@ -1,133 +1,82 @@
-# app.py
-
-import streamlit as st
 import numpy as np
-import librosa
-import soundfile as sf
-import io
-import time
-import pandas as pd
+import traceback
 
-from tensorflow.keras.models import load_model
+def try_reshape_and_predict(model, arr):
+    """
+    Try multiple common reshape permutations to match model.input_shape for Conv1D style models.
+    arr: numpy array of mfcc or preprocessed feature (e.g. shape (40,173) or (173,40) or (1,40,173,1))
+    Returns: (probs, used_shape) on success, or raises ValueError with diagnostics.
+    """
+    # Normalize to numpy
+    x = np.array(arr)
+    diagnostics = []
+    # Print model expectation
+    expected = model.input_shape  # tuple like (None, steps, features) or (None, steps, features, ...)
+    diagnostics.append(f"model.input_shape: {expected}")
+    diagnostics.append(f"original array shape: {x.shape}, ndim={x.ndim}")
 
-# ----------------------------------------------------
-# CONFIG
-# ----------------------------------------------------
-st.set_page_config(page_title="Speech Emotion Recognition", layout="centered")
+    # Generate candidate transforms
+    candidates = []
 
-MODEL_PATH = "model.h5"   # Your Keras model
-EMO_LABELS = ["Angry", "Disgust", "Fear", "Happy", "Sad", "Surprise", "Neutral"]
+    # If arr is 2D: (n_mfcc, frames) or (frames, n_mfcc)
+    if x.ndim == 2:
+        candidates.append(np.expand_dims(x.T, axis=0))  # (1, frames, n_mfcc)
+        candidates.append(np.expand_dims(x, axis=0))    # (1, n_mfcc, frames)
+        candidates.append(np.expand_dims(x[..., np.newaxis], axis=0))       # (1, n_mfcc, frames, 1)
+        candidates.append(np.expand_dims(x.T[..., np.newaxis], axis=0))     # (1, frames, n_mfcc, 1)
 
-# Audio feature extraction settings (ensure these match your training)
-SR = 22050          # Sampling rate
-N_MFCC = 40         # Number of MFCCs
-MAX_LEN = 173       # Max number of time frames to pad/truncate MFCC
+    # If arr is 3D already
+    elif x.ndim == 3:
+        candidates.append(x)                            # as-is
+        candidates.append(x.squeeze())                  # squeezed
+        # try swapping last two axes: (1, a, b) -> (1, b, a)
+        candidates.append(np.transpose(x, (0, 2, 1)) if x.shape[0] == 1 else np.transpose(x, (0, 2, 1)))
+        # try adding channel axis at end if missing
+        candidates.append(x[..., np.newaxis])
 
+    # If arr is 4D (you likely have an extra axis)
+    elif x.ndim == 4:
+        candidates.append(np.squeeze(x, axis=-1))
+        candidates.append(np.squeeze(x, axis=0))
+        candidates.append(np.squeeze(x))
+        candidates.append(np.transpose(np.squeeze(x), (0,2,1)) if x.shape[0] == 1 else np.transpose(np.squeeze(x), (0,2,1)))
 
-# ----------------------------------------------------
-# LOAD MODEL
-# ----------------------------------------------------
-@st.cache_resource
-def load_emotion_model():
-    return load_model(MODEL_PATH)
+    # always include a few more generic attempts
+    try:
+        # If it's 2D but not considered above (just in case)
+        candidates.append(np.expand_dims(x, axis=0))
+    except Exception as e:
+        diagnostics.append(f"expand_dims failed: {e}")
 
+    # Deduplicate by shape to avoid redundant tries
+    shaped = {}
+    for cand in candidates:
+        shaped[cand.shape] = cand
+    final_candidates = list(shaped.values())
 
-# ----------------------------------------------------
-# FEATURE EXTRACTION
-# ----------------------------------------------------
-def extract_mfcc(audio_bytes, sr=SR):
-    """Reads audio bytes, converts to mono, resamples, extracts MFCCs, pads/truncates."""
-    
-    # Load audio
-    with io.BytesIO(audio_bytes) as f:
-        signal, file_sr = sf.read(f)
+    # try predicting with each candidate
+    for cand in final_candidates:
+        diagnostics.append(f"trying candidate shape: {cand.shape}")
+        try:
+            preds = model.predict(cand)
+            diagnostics.append(f"SUCCESS with shape {cand.shape}")
+            return preds[0], cand.shape, diagnostics
+        except Exception as e:
+            diagnostics.append(f"FAILED for shape {cand.shape}: {type(e).__name__}: {e}")
+            # keep trying
 
-    # Convert to mono if stereo
-    if len(signal.shape) > 1:
-        signal = np.mean(signal, axis=1)
+    # If none worked, raise with full diagnostics
+    raise ValueError("All candidate shapes failed. Diagnostics:\n" + "\n".join(diagnostics))
 
-    # Resample if needed
-    if file_sr != sr:
-        signal = librosa.resample(signal.astype(np.float32), orig_sr=file_sr, target_sr=sr)
+# Usage in your code (replace how you call predict)
+try:
+    probs, used_shape, diagnostics = try_reshape_and_predict(model, mfcc)  # mfcc = your extracted mfcc arr
+    print("Used input shape for model:", used_shape)
+    # decode probs to label etc...
+except Exception as e:
+    print("Predict failed. See diagnostics below:")
+    print(e)
+    # optionally, print stack trace for more details:
+    traceback.print_exc()
 
-    # Extract MFCCs
-    mfcc = librosa.feature.mfcc(y=signal, sr=sr, n_mfcc=N_MFCC)
-
-    # Normalize
-    mfcc = (mfcc - np.mean(mfcc)) / (np.std(mfcc) + 1e-9)
-
-    # Pad / truncate
-    if mfcc.shape[1] < MAX_LEN:
-        padding = MAX_LEN - mfcc.shape[1]
-        mfcc = np.pad(mfcc, ((0,0), (0, padding)), mode="constant")
-    else:
-        mfcc = mfcc[:, :MAX_LEN]
-
-    # Model expects: (1, n_mfcc, time, 1)
-    mfcc = mfcc[..., np.newaxis]
-    mfcc = mfcc[np.newaxis, ...]
-
-    return mfcc
-
-
-# ----------------------------------------------------
-# PREDICTION
-# ----------------------------------------------------
-def predict_emotion(model, mfcc_input):
-    probs = model.predict(mfcc_input)[0]
-    top_idx = np.argmax(probs)
-    return EMO_LABELS[top_idx], float(probs[top_idx]), probs
-
-
-# ----------------------------------------------------
-# STREAMLIT UI
-# ----------------------------------------------------
-def main():
-
-    st.title("🎧 Speech Emotion Recognition")
-
-    st.markdown("Upload an audio file to detect the **emotion** from the voice.")
-
-    st.markdown("### Upload Audio File")
-    audio_file = st.file_uploader("Upload audio (wav, mp3, m4a)", type=["wav", "mp3", "m4a"])
-
-    # load model once
-    model = load_emotion_model()
-
-    if audio_file is not None:
-
-        audio_bytes = audio_file.read()
-
-        # Show audio player
-        st.markdown("### Audio Player")
-        st.audio(audio_bytes, format=audio_file.type)
-
-        with st.spinner("Processing and predicting..."):
-            mfcc_input = extract_mfcc(audio_bytes)
-            label, conf, probs = predict_emotion(model, mfcc_input)
-            time.sleep(0.3)
-
-        # Result box
-        st.markdown("### Predicted Emotion Box")
-        st.success(f"Predicted Emotion: **{label.upper()}**")
-        st.write(f"Confidence: **{conf:.2f}**")
-
-        # Probability graph
-        st.markdown("### Probability Chart")
-        prob_dict = {EMO_LABELS[i]: float(probs[i]) for i in range(len(EMO_LABELS))}
-        st.bar_chart(list(prob_dict.values()))
-
-        # Probability table
-        st.markdown("### Probability Table")
-        st.table([
-            {"Emotion": emo, "Confidence": f"{prob:.3f}"}
-            for emo, prob in prob_dict.items()
-        ])
-
-    else:
-        st.info("Please upload an audio file to get predictions.")
-
-
-if __name__ == "__main__":
-    main()
 
