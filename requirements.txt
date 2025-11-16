@@ -1,8 +1,11 @@
 streamlit>=1.18
 tensorflow==2.20.0
 numpy
-pillow
-opencv-python-headless
+librosa
+soundfile
+pandas
+joblib
+
 
 
 
