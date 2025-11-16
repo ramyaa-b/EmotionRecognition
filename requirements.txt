@@ -1,5 +1,7 @@
 streamlit>=1.18
-tensorflow==2.14.0   # or the tensorflow version you used
+scikit-learn
+joblib
 numpy
 pillow
 opencv-python-headless
+
